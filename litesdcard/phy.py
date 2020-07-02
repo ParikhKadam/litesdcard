@@ -17,21 +17,19 @@ from litesdcard.common import *
 
 # Pads ---------------------------------------------------------------------------------------------
 
-def _sdpads():
-    sdpads = Record([
-        ("clk", 1, DIR_M_TO_S),
-        ("cmd", [
-            ("i",  1, DIR_S_TO_M),
-            ("o",  1, DIR_M_TO_S),
-            ("oe", 1, DIR_M_TO_S)
-        ]),
-        ("data", [
-            ("i",  4, DIR_S_TO_M),
-            ("o",  4, DIR_M_TO_S),
-            ("oe", 1, DIR_M_TO_S)
-        ]),
-    ])
-    return sdpads
+_sdpads_layout = [
+    ("clk", 1),
+    ("cmd", [
+        ("i",  1),
+        ("o",  1),
+        ("oe", 1)
+    ]),
+    ("data", [
+        ("i",  4),
+        ("o",  4),
+        ("oe", 1)
+    ]),
+]
 
 # Configuration ------------------------------------------------------------------------------------
 
@@ -44,8 +42,9 @@ class SDPHYCFG(Module, AutoCSR):
 
 class SDPHYCMDW(Module):
     def __init__(self):
-        self.pads = pads = _sdpads()
-        self.sink = sink = stream.Endpoint([("data", 8)])
+        self.pads_in  = pads_in  = stream.Endpoint(_sdpads_layout)
+        self.pads_out = pads_out = stream.Endpoint(_sdpads_layout)
+        self.sink     = sink     = stream.Endpoint([("data", 8)])
 
         # # #
 
@@ -64,39 +63,48 @@ class SDPHYCMDW(Module):
             )
         )
         fsm.act("INIT",
-            pads.clk.eq(1),
-            pads.cmd.oe.eq(1),
-            pads.cmd.o.eq(1),
-            pads.data.oe.eq(1),
-            pads.data.o.eq(0b1111),
-            NextValue(count, count + 1),
-            If(count == (80-1),
-                NextValue(initialized, 1),
-                NextState("IDLE")
-            )
-        )
-        fsm.act("WRITE",
-            pads.clk.eq(1),
-            pads.cmd.oe.eq(1),
-            Case(count, {i: pads.cmd.o.eq(sink.data[8-1-i]) for i in range(8)}),
-            NextValue(count, count + 1),
-            If(count == (8-1),
-                If(sink.last,
-                    NextState("CLK8")
-                ).Else(
-                    sink.ready.eq(1),
+            pads_out.valid.eq(1),
+            pads_out.clk.eq(1),
+            pads_out.cmd.oe.eq(1),
+            pads_out.cmd.o.eq(1),
+            pads_out.data.oe.eq(1),
+            pads_out.data.o.eq(0b1111),
+            If(pads_out.valid & pads_out.ready,
+                NextValue(count, count + 1),
+                If(count == (80-1),
+                    NextValue(initialized, 1),
                     NextState("IDLE")
                 )
             )
         )
+        fsm.act("WRITE",
+            pads_out.valid.eq(1),
+            pads_out.clk.eq(1),
+            pads_out.cmd.oe.eq(1),
+            Case(count, {i: pads_out.cmd.o.eq(sink.data[8-1-i]) for i in range(8)}),
+            If(pads_out.valid & pads_out.ready,
+                NextValue(count, count + 1),
+                If(count == (8-1),
+                    If(sink.last,
+                        NextState("CLK8")
+                    ).Else(
+                        sink.ready.eq(1),
+                        NextState("IDLE")
+                    )
+                )
+            )
+        )
         fsm.act("CLK8",
-            pads.clk.eq(1),
-            pads.cmd.oe.eq(1),
-            pads.cmd.o.eq(1),
-            NextValue(count, count + 1),
-            If(count == (8-1),
-                sink.ready.eq(1),
-                NextState("IDLE")
+            pads_out.valid.eq(1),
+            pads_out.clk.eq(1),
+            pads_out.cmd.oe.eq(1),
+            pads_out.cmd.o.eq(1),
+            If(pads_out.valid & pads_out.ready,
+                NextValue(count, count + 1),
+                If(count == (8-1),
+                    sink.ready.eq(1),
+                    NextState("IDLE")
+                )
             )
         )
 
@@ -104,42 +112,50 @@ class SDPHYCMDW(Module):
 
 @ResetInserter()
 class SDPHYR(Module):
-    def __init__(self, idata, skip_start_bit=False):
-        self.source = stream.Endpoint([("data", 8)])
+    def __init__(self, cmd=False, data=False, data_width=1, skip_start_bit=False):
+        assert cmd or data
+        self.pads_in  = pads_in = stream.Endpoint(_sdpads_layout)
+        self.source   = source  = stream.Endpoint([("data", 8)])
 
         # # #
+
+        pads_in_data = pads_in.cmd.i[:data_width] if cmd else pads_in.data.i[:data_width]
+        print(len(pads_in_data))
 
         # Xfer starts when data == 0
         start = Signal()
         run   = Signal()
-        self.comb += start.eq(idata == 0)
-        self.sync += run.eq(start | run)
+        self.comb += start.eq(pads_in_data == 0)
+        self.sync += If(pads_in.valid & pads_in.ready, run.eq(start | run))
 
         # Convert data to 8-bit stream
-        converter = stream.Converter(len(idata), 8, reverse=True)
+        converter = stream.Converter(data_width, 8, reverse=True)
         buf       = stream.Buffer([("data", 8)])
         self.submodules += converter, buf
         self.comb += [
-            converter.sink.valid.eq(run if skip_start_bit else (start | run)),
-            converter.sink.data.eq(idata),
+            converter.sink.valid.eq(pads_in.valid & (run if skip_start_bit else (start | run))),
+            converter.sink.data.eq(pads_in_data),
+            pads_in.ready.eq(converter.sink.ready),
             converter.source.connect(buf.sink),
-            buf.source.connect(self.source)
+            buf.source.connect(source)
         ]
 
 # SDCard PHY Command Read --------------------------------------------------------------------------
 
 class SDPHYCMDR(Module):
     def __init__(self, cfg):
-        self.pads   = pads   = _sdpads()
-        self.sink   = sink   = stream.Endpoint([("length", 8)])
-        self.source = source = stream.Endpoint([("data", 8), ("status", 3)])
+        self.pads_in  = pads_in  = stream.Endpoint(_sdpads_layout)
+        self.pads_out = pads_out = stream.Endpoint(_sdpads_layout)
+        self.sink    = sink   = stream.Endpoint([("length", 8)])
+        self.source  = source = stream.Endpoint([("data", 8), ("status", 3)])
 
         # # #
 
         timeout = Signal(32)
         count   = Signal(8)
 
-        cmdr = SDPHYR(pads.cmd.i, skip_start_bit=False)
+        cmdr = SDPHYR(cmd=True, data_width=1, skip_start_bit=False)
+        self.comb += pads_in.connect(cmdr.pads_in)
         fsm  = FSM(reset_state="IDLE")
         self.submodules += cmdr, fsm
         fsm.act("IDLE",
@@ -151,17 +167,21 @@ class SDPHYCMDR(Module):
             )
         )
         fsm.act("WAIT",
-            pads.clk.eq(1),
+            pads_out.valid.eq(1),
+            pads_out.clk.eq(1),
             NextValue(cmdr.reset, 0),
-            NextValue(timeout, timeout + 1),
-            If(cmdr.source.valid,
-                NextState("CMD")
-            ).Elif(timeout > cfg.timeout,
-                NextState("TIMEOUT")
+            If(pads_out.valid & pads_out.ready,
+                NextValue(timeout, timeout + 1),
+                If(cmdr.source.valid,
+                    NextState("CMD")
+                ).Elif(timeout > cfg.timeout,
+                    NextState("TIMEOUT")
+                )
             )
         )
         fsm.act("CMD",
-            pads.clk.eq(1),
+            pads_out.valid.eq(1),
+            pads_out.clk.eq(1),
             source.valid.eq(cmdr.source.valid),
             source.status.eq(SDCARD_STREAM_STATUS_OK),
             source.last.eq(count == (sink.length - 1)),
@@ -181,13 +201,16 @@ class SDPHYCMDR(Module):
             )
         )
         fsm.act("CLK8",
-            pads.clk.eq(1),
-            pads.cmd.oe.eq(1),
-            pads.cmd.o.eq(1),
-            NextValue(count, count + 1),
-            If(count == 7,
-                sink.ready.eq(1),
-                NextState("IDLE")
+            pads_out.valid.eq(1),
+            pads_out.clk.eq(1),
+            pads_out.cmd.oe.eq(1),
+            pads_out.cmd.o.eq(1),
+            If(pads_out.valid & pads_out.ready,
+                NextValue(count, count + 1),
+                If(count == 7,
+                    sink.ready.eq(1),
+                    NextState("IDLE")
+                )
             )
         )
         fsm.act("TIMEOUT",
@@ -203,14 +226,16 @@ class SDPHYCMDR(Module):
 # SDCard PHY CRC Response --------------------------------------------------------------------------
 
 class SDPHYCRCR(Module):
-    def __init__(self, idata):
+    def __init__(self):
+        self.pads_in  = pads_in  = stream.Endpoint(_sdpads_layout)
         self.start = Signal()
         self.valid = Signal()
         self.error = Signal()
 
         # # #
 
-        crcr = SDPHYR(idata, skip_start_bit=True)
+        crcr = SDPHYR(data=True, data_width=1, skip_start_bit=True)
+        self.comb += pads_in.connect(crcr.pads_in)
         fsm  = FSM(reset_state="IDLE")
         self.submodules += crcr, fsm
         fsm.act("IDLE",
@@ -233,7 +258,8 @@ class SDPHYCRCR(Module):
 
 class SDPHYDATAW(Module):
     def __init__(self):
-        self.pads = pads = _sdpads()
+        self.pads_in  = pads_in  = stream.Endpoint(_sdpads_layout)
+        self.pads_out = pads_out = stream.Endpoint(_sdpads_layout)
         self.sink = sink = stream.Endpoint([("data", 8)])
 
         # # #
@@ -241,58 +267,76 @@ class SDPHYDATAW(Module):
         wrstarted = Signal()
         count     = Signal(8)
 
-        crc = SDPHYCRCR(pads.data.i[0]) # FIXME: Report valid/errors to software.
+        crc = SDPHYCRCR() # FIXME: Report valid/errors to software.
+        self.comb += pads_in.connect(crc.pads_in)
         fsm = fsm = FSM(reset_state="IDLE")
         self.submodules += crc, fsm
         fsm.act("IDLE",
             If(sink.valid,
-                pads.clk.eq(1),
-                pads.data.oe.eq(1),
+                pads_out.valid.eq(1),
+                pads_out.clk.eq(1),
+                pads_out.data.oe.eq(1),
                 If(wrstarted,
-                    pads.data.o.eq(sink.data[4:8]),
-                    NextState("DATA")
+                    pads_out.data.o.eq(sink.data[4:8]),
+                    If(pads_out.valid & pads_out.ready,
+                        NextState("DATA")
+                    )
                 ).Else(
-                    pads.data.o.eq(0),
-                    NextState("START")
+                    pads_out.data.o.eq(0),
+                    If(pads_out.valid & pads_out.ready,
+                        NextState("START")
+                    )
                 )
             )
         )
         fsm.act("START",
-            pads.clk.eq(1),
-            pads.data.oe.eq(1),
-            pads.data.o.eq(sink.data[4:8]),
+            pads_out.valid.eq(1),
+            pads_out.clk.eq(1),
+            pads_out.data.oe.eq(1),
+            pads_out.data.o.eq(sink.data[4:8]),
             NextValue(wrstarted, 1),
-            NextState("DATA")
+            If(pads_out.valid & pads_out.ready,
+                NextState("DATA")
+            )
         )
         fsm.act("DATA",
-            pads.clk.eq(1),
-            pads.data.oe.eq(1),
-            pads.data.o.eq(sink.data[0:4]),
-            If(sink.last,
-                NextState("STOP")
-            ).Else(
-                sink.ready.eq(1),
-                NextState("IDLE")
+            pads_out.valid.eq(1),
+            pads_out.clk.eq(1),
+            pads_out.data.oe.eq(1),
+            pads_out.data.o.eq(sink.data[0:4]),
+            If(pads_out.valid & pads_out.ready,
+                If(sink.last,
+                    NextState("STOP")
+                ).Else(
+                    sink.ready.eq(1),
+                    NextState("IDLE")
+                )
             )
         )
         fsm.act("STOP",
-            pads.clk.eq(1),
-            pads.data.oe.eq(1),
-            pads.data.o.eq(0b1111),
-            NextValue(wrstarted, 0),
-            crc.start.eq(1),
-            NextState("RESPONSE")
+            pads_out.valid.eq(1),
+            pads_out.clk.eq(1),
+            pads_out.data.oe.eq(1),
+            pads_out.data.o.eq(0b1111),
+            If(pads_out.valid & pads_out.ready,
+                NextValue(wrstarted, 0),
+                crc.start.eq(1),
+                NextState("RESPONSE")
+            )
         )
         fsm.act("RESPONSE",
-            pads.clk.eq(1),
-            If(count < 16,
-                NextValue(count, count + 1),
-            ).Else(
-                # wait while busy
-                If(pads.data.i[0],
-                    NextValue(count, 0),
-                    sink.ready.eq(1),
-                    NextState("IDLE")
+            pads_out.valid.eq(1),
+            pads_out.clk.eq(1),
+            If(pads_out.valid & pads_out.ready,
+                If(count < 16,
+                    NextValue(count, count + 1),
+                ).Else(
+                    # wait while busy
+                    If(pads_out.data.i[0],
+                        NextValue(count, 0),
+                        sink.ready.eq(1),
+                        NextState("IDLE")
+                    )
                 )
             )
         )
@@ -301,7 +345,8 @@ class SDPHYDATAW(Module):
 
 class SDPHYDATAR(Module):
     def __init__(self, cfg):
-        self.pads   = pads   = _sdpads()
+        self.pads_in  = pads_in  = stream.Endpoint(_sdpads_layout)
+        self.pads_out = pads_out = stream.Endpoint(_sdpads_layout)
         self.sink   = sink   = stream.Endpoint([("length", 8)])
         self.source = source = stream.Endpoint([("data", 8), ("status", 3)])
 
@@ -310,31 +355,39 @@ class SDPHYDATAR(Module):
         timeout = Signal(32)
         count   = Signal(10)
 
-        datar = SDPHYR(pads.data.i, skip_start_bit=True)
+        datar = SDPHYR(data=True, data_width=4, skip_start_bit=True)
+        self.comb += pads_in.connect(datar.pads_in)
         fsm   = FSM(reset_state="IDLE")
         self.submodules += datar, fsm
         fsm.act("IDLE",
             NextValue(count, 0),
             If(sink.valid,
-                pads.clk.eq(1),
+                pads_out.valid.eq(1),
+                pads_out.clk.eq(1),
                 NextValue(timeout, 0),
                 NextValue(count, 0),
                 NextValue(datar.reset, 1),
-                NextState("WAIT")
+                If(pads_out.valid & pads_out.ready,
+                    NextState("WAIT")
+                )
             )
         )
         fsm.act("WAIT",
-            pads.clk.eq(1),
+            pads_out.valid.eq(1),
+            pads_out.clk.eq(1),
             NextValue(datar.reset, 0),
-            NextValue(timeout, timeout + 1),
-            If(datar.source.valid,
-                NextState("DATA")
-            ).Elif(timeout > cfg.timeout,
-                NextState("TIMEOUT")
+            If(pads_out.valid & pads_out.ready,
+                NextValue(timeout, timeout + 1),
+                If(datar.source.valid,
+                    NextState("DATA")
+                ).Elif(timeout > cfg.timeout,
+                    NextState("TIMEOUT")
+                )
             )
         )
         fsm.act("DATA",
-            pads.clk.eq(1),
+            pads_out.valid.eq(1),
+            pads_out.clk.eq(1),
             source.valid.eq(datar.source.valid),
             source.status.eq(SDCARD_STREAM_STATUS_OK),
             source.last.eq(count == (cfg.blocksize + 8 - 1)), # 1 block + 64-bit CRC
@@ -354,11 +407,14 @@ class SDPHYDATAR(Module):
             )
         )
         fsm.act("CLK40",
-            pads.clk.eq(1),
-            NextValue(count, count + 1),
-            If(count == (40-1),
-                sink.ready.eq(1),
-                NextState("IDLE")
+            pads_out.valid.eq(1),
+            pads_out.clk.eq(1),
+            If(pads_out.valid & pads_out.ready,
+                NextValue(count, count + 1),
+                If(count == (40-1),
+                    sink.ready.eq(1),
+                    NextState("IDLE")
+                )
             )
         )
         fsm.act("TIMEOUT",
@@ -451,7 +507,7 @@ class SDPHY(Module, AutoCSR):
 
         # # #
 
-        self.sdpads = sdpads = _sdpads()
+        self.sdpads = sdpads = Record(_sdpads_layout)
 
         # IOs
         if hasattr(pads, "cmd_t") and hasattr(pads, "dat_t"):
@@ -461,12 +517,14 @@ class SDPHY(Module, AutoCSR):
 
         # Connect pads to/from submodules.
         self.comb += [
-            sdpads.clk.eq(    reduce(or_, [m.pads.clk     for m in [cmdw, cmdr, dataw, datar]])),
-            sdpads.cmd.oe.eq( reduce(or_, [m.pads.cmd.oe  for m in [cmdw, cmdr, dataw, datar]])),
-            sdpads.cmd.o.eq(  reduce(or_, [m.pads.cmd.o   for m in [cmdw, cmdr, dataw, datar]])),
-            sdpads.data.oe.eq(reduce(or_, [m.pads.data.oe for m in [cmdw, cmdr, dataw, datar]])),
-            sdpads.data.o.eq( reduce(or_, [m.pads.data.o  for m in [cmdw, cmdr, dataw, datar]])),
+            sdpads.clk.eq(    reduce(or_, [m.pads_out.clk     for m in [cmdw, cmdr, dataw, datar]])),
+            sdpads.cmd.oe.eq( reduce(or_, [m.pads_out.cmd.oe  for m in [cmdw, cmdr, dataw, datar]])),
+            sdpads.cmd.o.eq(  reduce(or_, [m.pads_out.cmd.o   for m in [cmdw, cmdr, dataw, datar]])),
+            sdpads.data.oe.eq(reduce(or_, [m.pads_out.data.oe for m in [cmdw, cmdr, dataw, datar]])),
+            sdpads.data.o.eq( reduce(or_, [m.pads_out.data.o  for m in [cmdw, cmdr, dataw, datar]])),
         ]
         for m in [cmdw, cmdr, dataw, datar]:
-            self.comb += m.pads.cmd.i.eq(sdpads.cmd.i)
-            self.comb += m.pads.data.i.eq(sdpads.data.i)
+            self.comb += m.pads_out.ready.eq(1)
+            self.comb += m.pads_in.valid.eq(1)
+            self.comb += m.pads_in.cmd.i.eq(sdpads.cmd.i)
+            self.comb += m.pads_in.data.i.eq(sdpads.data.i)
